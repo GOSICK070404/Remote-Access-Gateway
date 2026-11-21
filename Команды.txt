@@ -1,0 +1,305 @@
+Чистка системы:
+sudo systemctl stop snapd.service snapd.socket
+for m in $(mount | awk '$3 ~ /^\/snap\// {print $3}'); do sudo umount "$m"; done
+sudo apt purge -y snapd
+sudo rm -rf /var/lib/snapd /var/snap /snap /root/snap ~/snap
+sudo apt autoremove --purge -y
+sudo apt clean
+sudo journalctl --vacuum-size=50M
+
+
+Настройка цели TVM:
+Ставим ssh:
+sudo apt install openssh-server -y
+sudo systemctl enable --now ssh
+
+sudo systemctl status ssh
+
+Настраиваем сеть:
+cat /etc/netplan/*.yaml
+nmcli -f NAME,DEVICE,FILENAME con show
+sudo nmcli con mod "enp0s8-dhcp" ipv4.method manual ipv4.addresses 192.168.56.20/24
+sudo nmcli con up "enp0s8-dhcp"
+
+ip -br a
+ping -c 3 192.168.56.1
+
+Правило доступа по ssh только с шлюза:
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+sudo ufw allow from 192.168.56.10 to any port 22 proto tcp
+sudo ufw allow from 192.168.56.10 to any port 3389 proto tcp
+sudo ufw enable
+
+sudo ufw status verbose
+
+Настройка RDP на целевой ВМ:
+sudo apt update
+sudo apt install -y xrdp
+sudo systemctl enable --now xrdp
+sudo apt install -y xfce4 xfce4-goodies
+echo "xfce4-session" | sudo tee /home/GIGANT/.xsession > /dev/null //возможно не обязательно
+sudo chown GIGANT:GIGANT /home/GIGANT/.xsession
+sudo systemctl restart xrdp
+
+sudo systemctl status xrdp
+
+
+Настройка шлюза GVM:
+Ставим ssh: // Для упрощения ввода команд. Далее выключаем.
+sudo apt install openssh-server -y
+sudo systemctl enable --now ssh
+
+sudo systemctl status ssh
+
+Настраиваем сеть:
+sudo nano /etc/netplan/50-cloud-init.yaml
+
+network:
+  version: 2
+  ethernets:
+    enp0s3:
+      dhcp4: true
+    enp0s8:
+      dhcp4: no
+      addresses:
+        - 192.168.56.10/24
+
+sudo netplan apply
+
+ip -br a
+ping -c 3 192.168.56.20
+
+Ставим docker:
+sudo apt update && sudo apt install -y ca-certificates curl gnupg
+sudo install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+sudo chmod a+r /etc/apt/keyrings/docker.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+sudo apt update
+sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo systemctl enable --now docker
+sudo usermod -aG docker $USER
+
+docker --version
+docker run hello-world
+
+newgrp docker
+docker ps
+
+Развёртываем Guacamole + БД + TOTP-токены:
+mkdir -p ~/guacamole-stack && cd ~/guacamole-stack
+
+Файл docker-compose.yml:
+cat << 'EOF' > docker-compose.yml
+version: '3.8'
+
+services:
+  # ===== PostgreSQL для Guacamole =====
+  postgres-guac:
+    image: postgres:15
+    container_name: postgres-guac
+    restart: always
+    environment:
+      PGDATA: /var/lib/postgresql/data/guacamole
+      POSTGRES_DB: guacamole_db
+      POSTGRES_USER: guacamole_user
+      POSTGRES_PASSWORD: guacamole_password
+    volumes:
+      - postgres-guac-data:/var/lib/postgresql/data
+    networks:
+      - guacnet
+
+  # ===== guacd =====
+  guacd:
+    image: guacamole/guacd:latest
+    container_name: guacd
+    restart: always
+    networks:
+      - guacnet
+
+  # ===== PostgreSQL для Authentik =====
+  postgres-authentik:
+    image: postgres:15
+    container_name: postgres-authentik
+    restart: always
+    environment:
+      POSTGRES_DB: authentik
+      POSTGRES_USER: authentik
+      POSTGRES_PASSWORD: authentik_password
+    volumes:
+      - postgres-authentik-data:/var/lib/postgresql/data
+    networks:
+      - guacnet
+
+  # ===== Redis для Authentik =====
+  redis:
+    image: redis:alpine
+    container_name: redis-authentik
+    restart: always
+    networks:
+      - guacnet
+
+  # ===== Authentik Server =====
+  authentik-server:
+    image: ghcr.io/goauthentik/server:2024.12.1
+    container_name: authentik-server
+    restart: always
+    command: server
+    environment:
+      AUTHENTIK_REDIS__HOST: redis
+      AUTHENTIK_POSTGRESQL__HOST: postgres-authentik
+      AUTHENTIK_POSTGRESQL__USER: authentik
+      AUTHENTIK_POSTGRESQL__NAME: authentik
+      AUTHENTIK_POSTGRESQL__PASSWORD: authentik_password
+      AUTHENTIK_SECRET_KEY: change-me-to-a-long-random-string-please
+    ports:
+      - "9000:9000"   # HTTP интерфейс Authentik
+      - "9443:9443"   # HTTPS интерфейс Authentik
+    volumes:
+      - authentik-media:/media
+      - authentik-custom-templates:/templates
+    depends_on:
+      - postgres-authentik
+      - redis
+    networks:
+      - guacnet
+
+  # ===== Authentik Worker =====
+  authentik-worker:
+    image: ghcr.io/goauthentik/server:2024.12.1
+    container_name: authentik-worker
+    restart: always
+    command: worker
+    environment:
+      AUTHENTIK_REDIS__HOST: redis
+      AUTHENTIK_POSTGRESQL__HOST: postgres-authentik
+      AUTHENTIK_POSTGRESQL__USER: authentik
+      AUTHENTIK_POSTGRESQL__NAME: authentik
+      AUTHENTIK_POSTGRESQL__PASSWORD: authentik_password
+      AUTHENTIK_SECRET_KEY: change-me-to-a-long-random-string-please
+    volumes:
+      - authentik-media:/media
+      - authentik-custom-templates:/templates
+    depends_on:
+      - postgres-authentik
+      - redis
+    networks:
+      - guacnet
+
+  # ===== Guacamole & OIDC =====
+  guacamole:
+    image: guacamole/guacamole:latest
+    container_name: guacamole
+    restart: always
+    ports:
+      - "8080:8080"
+    environment:
+      GUACD_HOSTNAME: guacd
+      POSTGRESQL_HOSTNAME: postgres-guac
+      POSTGRESQL_DATABASE: guacamole_db
+      POSTGRESQL_USER: guacamole_user
+      POSTGRESQL_PASSWORD: guacamole_password
+      # OIDC параметры (будут заполнены после настройки Authentik)
+      OPENID_AUTHORIZATION_ENDPOINT: http://authentik-server:9000/application/o/authorize/
+      OPENID_JWKS_ENDPOINT: http://authentik-server:9000/application/o/jwks/guacamole/
+      OPENID_ISSUER: http://authentik-server:9000/application/o/guacamole/
+      OPENID_CLIENT_ID: GUACAMOLE_CLIENT_ID
+      OPENID_CLIENT_SECRET: GUACAMOLE_CLIENT_SECRET
+      OPENID_REDIRECT_URI: http://192.168.56.10:8080/guacamole/callback
+      OPENID_USERNAME_CLAIM_TYPE: preferred_username
+    depends_on:
+      - postgres-guac
+      - guacd
+      - authentik-server
+    networks:
+      - guacnet
+
+volumes:
+  postgres-guac-data:
+  postgres-authentik-data:
+  authentik-media:
+  authentik-custom-templates:
+
+networks:
+  guacnet:
+    driver: bridge
+EOF
+
+Инициализация БД Guacamole:
+docker compose up -d postgres-guac
+sleep 10
+docker run --rm guacamole/guacamole /opt/guacamole/bin/initdb.sh --postgresql > initdb.sql
+cat initdb.sql | docker exec -i postgres-guac psql -U guacamole_user -d guacamole_db
+docker compose down
+
+Запуск Authentik:
+docker compose up -d postgres-authentik redis authentik-server authentik-worker
+docker compose ps
+
+Создание провайдера в Authentik:
+"Приложения" → "Провайдеры" → "Создать" → "OAuth2/OpenID Provider"
+
+ID клиента *  xg0XFcbM92cAV0buiSGLhCPKMtYVBcTa8k8PQivx
+Секрет клиента  Is0xeVMLcQaN2hrZzOf1UrB0vKP4MSTpoEWwNTUUuoMjUKJuqgNxeY1i7IUhOuna0rZnWmcE4ngd4vPRbgyKmc45k8Zu83xOCdHrQLpBA13CFRkHYOELKx2Z9R6yMC9M
+
+"Приложения" → "Приложения" → "Создать"
+
+Обновление конфига Guacamole реальными данными:
+nano ~/guacamole-stack/docker-compose.yml // меняем значения на актуальные   
+OPENID_CLIENT_ID: xg0XFcbM92cAV0buiSGLhCPKMtYVBcTa8k8PQivx
+OPENID_CLIENT_SECRET: Is0xeVMLcQaN2hrZzOf1UrB0vKP4MSTpoEWwNTUUuoMjUKJuqgNxeY1i7IUhOuna0rZnWmcE4ngd4vPRbgyKmc45k8Zu83xOCdHrQLpBA13CFRkHYOELKx2Z9R6yMC9M
+OPENID_AUTHORIZATION_ENDPOINT: http://192.168.56.10:9000/application/o/authorize/
+OPENID_JWKS_ENDPOINT: http://192.168.56.10:9000/application/o/guacamole/jwks/
+OPENID_ISSUER: http://192.168.56.10:9000/application/o/guacamole/
+
+Запуск стека и настройка MFA:
+docker compose up -d
+docker compose ps
+
+"Настройки" → "MFA устройства"
+
+Регистрируем:
+Установка google authenticator
+Скан Qr-кода
+
+«Потоки и этапы» → «Потоки»
+
+Включаем OIDC:
+sed -i '/OPENID_USERNAME_CLAIM_TYPE/a\      OPENID_ENABLED: "true"' docker-compose.yml
+grep -n "OPENID_ENABLED" docker-compose.yml
+docker compose up -d --force-recreate guacamole
+
+Создаем нового пользователя akadmin и отключаем стартового guacadmin в целях безопасности в GUI Guacamole.
+
+Меняем место назначения на актуальное:
+sed -i 's|OPENID_REDIRECT_URI: http://192.168.56.10:8080/guacamole/callback|OPENID_REDIRECT_URI: http://192.168.56.10:8080/guacamole/|' docker-compose.yml
+grep OPENID_REDIRECT_URI docker-compose.yml
+docker compose up -d --force-recreate guacamole
+
+Генерируй реальный секрет Authentik:
+NEWKEY=$(openssl rand -hex 32)
+sed -i "s|AUTHENTIK_SECRET_KEY: change-me-to-a-long-random-string-please|AUTHENTIK_SECRET_KEY: $NEWKEY|" docker-compose.yml
+grep AUTHENTIK_SECRET_KEY docker-compose.yml
+docker compose up -d --force-recreate authentik-server authentik-worker
+
+Выключаем ssh:
+sudo systemctl disable --now ssh
+sudo systemctl disable --now ssh.socket
+sudo systemctl disable --now ssh.service
+
+sudo systemctl status ssh
+sudo ss -tlnp | grep :22
+
+Создаем в подключениях нашу целевую ВМ:
+Через akadmin делаем удаленный доступ к ВМ по SSH и RDP.
+
+http://192.168.56.10:8080/guacamole/api/ext/openid/login  
+// вход в аккаунт удалённого доступа
+http://192.168.56.10:9000/  
+// вход в админку системы многофакторки
+
+На случай перезапуска:
+cd ~/guacamole-stack
+docker compose restart guacamole
+docker compose ps
