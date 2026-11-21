@@ -1,13 +1,3 @@
-Чистка системы:
-sudo systemctl stop snapd.service snapd.socket
-for m in $(mount | awk '$3 ~ /^\/snap\// {print $3}'); do sudo umount "$m"; done
-sudo apt purge -y snapd
-sudo rm -rf /var/lib/snapd /var/snap /snap /root/snap ~/snap
-sudo apt autoremove --purge -y
-sudo apt clean
-sudo journalctl --vacuum-size=50M
-
-
 Настройка цели TVM:
 Ставим ssh:
 sudo apt install openssh-server -y
